@@ -1,6 +1,6 @@
 # nstor
 
-Force select Linux applications through Tor using a dedicated **network namespace + veth pair + transparent proxy**.
+Force selected Linux applications through Tor using a dedicated **network namespace + veth pair + transparent proxy**.
 
 Applications launched with `nstor` see only a private network interface. All their TCP and DNS traffic is redirected to a local Tor instance. The processes themselves run as your normal user, not as root.
 
