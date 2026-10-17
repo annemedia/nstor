@@ -50,12 +50,9 @@ sudo install -m 755 nstor /usr/local/bin/nstor
 sudo nstor setup
 
 # Run any command inside the Tor namespace
-sudo nstor run firefox
+sudo nstor firefox
 sudo nstor curl https://check.torproject.org/api/ip
 sudo nstor keybase
-
-# Shorthand (same as "run")
-sudo nstor chromium
 
 # Remove rules and namespace
 sudo nstor clean
