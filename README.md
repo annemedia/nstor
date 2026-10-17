@@ -19,6 +19,13 @@ Applications launched with `nstor` see only a private network interface. All the
 - `tor` (with `TransPort` and `DNSPort` enabled)
 - `dnsmasq`
 - Root privileges for setup (the application itself drops privileges)
+  
+- run once (and add to rc.local/a boot script)
+```bash
+sudo ip link add nstor-dummy type dummy 2>/dev/null || true
+sudo ip addr add 10.200.1.1/32 dev nstor-dummy
+sudo ip link set nstor-dummy up
+```
 
 ### Example Tor configuration (`/etc/tor/torrc`)
 
