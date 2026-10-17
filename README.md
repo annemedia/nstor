@@ -33,9 +33,7 @@ sudo ip link set nstor-dummy up
 TransPort 10.200.1.1:9040
 DNSPort 127.0.0.1:5353
 VirtualAddrNetworkIPv4 10.192.0.0/10
-AutomapHostsOnResolve 1
 ClientOnly 1
-SocksPolicy accept *
 ```
 
 Adjust the TransPort address if you change the default subnet in the script.
