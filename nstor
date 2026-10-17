@@ -1,0 +1,222 @@
+#!/bin/bash
+# nstor - network namespace + veth + Tor (dnsmasq for DNS)
+# Made for Slackware, can be easily adapted for any linux system
+# Dependecies: dnsmasq, tor, iptables, iproute2
+# torrc needs:
+# DNSPort 127.0.0.1:5353
+# TransPort 127.0.0.1:9040
+# TransPort 10.200.1.1:9040
+# VirtualAddrNetworkIPv4 10.192.0.0/10
+# then run once (and add to rc.local/boot script)
+# sudo ip link add nstor-dummy type dummy 2>/dev/null || true
+# sudo ip addr add 10.200.1.1/32 dev nstor-dummy
+#sudo ip link set nstor-dummy up
+set -euo pipefail
+
+NS_NAME="torified"
+VETH_HOST="veth-tor"
+VETH_NS="veth-ns"
+HOST_IP="10.200.1.1"
+NS_IP="10.200.1.2"
+SUBNET="10.200.1.0/24"
+TRANS_PORT=9040
+DNS_PORT=5353
+DNSMASQ_CONF="/tmp/dnsmasq-nstor.conf"
+DNSMASQ_PID="/tmp/dnsmasq-nstor.pid"
+DNSMASQ_LOG="/tmp/dnsmasq-nstor.log"
+IPTABLES_SAVE="/etc/nstor/iptables.rules"
+
+require_root() { [[ $EUID -eq 0 ]] || { echo "Must be root" >&2; exit 1; }; }
+
+ensure_veth_host() {
+  ip netns add "$NS_NAME" 2>/dev/null || true
+  if ! ip link show "$VETH_HOST" &>/dev/null; then
+    ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+    ip link set "$VETH_NS" netns "$NS_NAME"
+  fi
+  if ! ip addr show dev "$VETH_HOST" | grep -q "$HOST_IP"; then
+    ip addr add "${HOST_IP}/24" dev "$VETH_HOST"
+  fi
+  ip link set "$VETH_HOST" up
+}
+
+
+start_dnsmasq() {
+  stop_dnsmasq >/dev/null 2>&1 || true
+  if ss -uln | grep -q "${HOST_IP}:53"; then
+    fuser -k -n udp 53 2>/dev/null || true
+    sleep 0.3
+  fi
+
+  cat > "$DNSMASQ_CONF" <<EOF
+listen-address=${HOST_IP}
+bind-interfaces
+port=53
+no-resolv
+no-hosts
+server=127.0.0.1#${DNS_PORT}
+domain-needed
+bogus-priv
+stop-dns-rebind
+log-queries
+log-facility=${DNSMASQ_LOG}
+EOF
+
+  dnsmasq -C "$DNSMASQ_CONF" --pid-file="$DNSMASQ_PID" || {
+    echo "dnsmasq failed to start:" >&2
+    ss -ulnp | grep ":53" || true
+    return 1
+  }
+  echo "dnsmasq started (PID $(cat "$DNSMASQ_PID"))"
+}
+
+stop_dnsmasq() {
+  if [[ -f "$DNSMASQ_PID" ]]; then
+    kill "$(cat "$DNSMASQ_PID")" 2>/dev/null || true
+    rm -f "$DNSMASQ_PID"
+  fi
+  fuser -k -n udp "${HOST_IP}:53" 2>/dev/null || true
+  pkill -f "dnsmasq.*${HOST_IP}" 2>/dev/null || true
+  sleep 0.2
+  rm -f "$DNSMASQ_CONF" "$DNSMASQ_LOG"
+  echo "dnsmasq stopped"
+}
+
+setup_host() {
+  require_root
+
+  if ! ip addr show | grep -q "${HOST_IP}"; then
+    echo "Error: ${HOST_IP} not present. Create the dummy interface first:" >&2
+    echo "  ip link add nstor-dummy type dummy" >&2
+    echo "  ip addr add ${HOST_IP}/32 dev nstor-dummy" >&2
+    echo "  ip link set nstor-dummy up" >&2
+    exit 1
+  fi
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null
+  sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null || true
+  sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null || true   # optional global
+
+  ip netns add "$NS_NAME" 2>/dev/null || true
+  ensure_veth_host
+
+  # IPv4 TCP redirect
+  iptables -t nat -N TORNS 2>/dev/null || true
+  iptables -t nat -F TORNS
+  iptables -t nat -A TORNS -p tcp -j REDIRECT --to-ports "$TRANS_PORT"
+  iptables -t nat -C PREROUTING -i "$VETH_HOST" -j TORNS 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "$VETH_HOST" -j TORNS
+
+  # Drop non-DNS UDP (blocks QUIC/WebRTC)
+  iptables -C FORWARD -i "$VETH_HOST" -p udp ! --dport 53 -j DROP 2>/dev/null || \
+    iptables -A FORWARD -i "$VETH_HOST" -p udp ! --dport 53 -j DROP
+  iptables -C INPUT -i "$VETH_HOST" -p udp ! --dport 53 -j DROP 2>/dev/null || \
+    iptables -A INPUT -i "$VETH_HOST" -p udp ! --dport 53 -j DROP
+
+  # Allow the rest
+  iptables -C INPUT -i "$VETH_HOST" -j ACCEPT 2>/dev/null || \
+    iptables -A INPUT -i "$VETH_HOST" -j ACCEPT
+  iptables -C FORWARD -i "$VETH_HOST" -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "$VETH_HOST" -j ACCEPT
+  iptables -C FORWARD -o "$VETH_HOST" -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -o "$VETH_HOST" -j ACCEPT
+
+  # IPv6: drop everything from the veth
+  ip6tables -C FORWARD -i "$VETH_HOST" -j DROP 2>/dev/null || \
+    ip6tables -A FORWARD -i "$VETH_HOST" -j DROP
+  ip6tables -C INPUT -i "$VETH_HOST" -j DROP 2>/dev/null || \
+    ip6tables -A INPUT -i "$VETH_HOST" -j DROP
+
+  start_dnsmasq
+  # Save rules for persistence
+  mkdir -p "$(dirname "$IPTABLES_SAVE")"
+  iptables-save > "$IPTABLES_SAVE"
+  echo "Host rules + dnsmasq ready (TCP → ${HOST_IP}:${TRANS_PORT})"
+  echo "Rules saved to $IPTABLES_SAVE"
+}
+
+clean_host() {
+  require_root
+  stop_dnsmasq
+
+  iptables -t nat -D PREROUTING -i "$VETH_HOST" -j TORNS 2>/dev/null || true
+  iptables -t nat -F TORNS 2>/dev/null || true
+  iptables -t nat -X TORNS 2>/dev/null || true
+
+  iptables -D FORWARD -i "$VETH_HOST" -p udp ! --dport 53 -j DROP 2>/dev/null || true
+  iptables -D INPUT -i "$VETH_HOST" -p udp ! --dport 53 -j DROP 2>/dev/null || true
+  iptables -D INPUT -i "$VETH_HOST" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$VETH_HOST" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -o "$VETH_HOST" -j ACCEPT 2>/dev/null || true
+
+  ip6tables -D FORWARD -i "$VETH_HOST" -j DROP 2>/dev/null || true
+  ip6tables -D INPUT -i "$VETH_HOST" -j DROP 2>/dev/null || true
+
+  # Only remove the netns and veth — leave the dummy interface and 10.200.1.1 alone
+  ip netns del "$NS_NAME" 2>/dev/null || true
+  ip link del "$VETH_HOST" 2>/dev/null || true
+
+  rm -f "$IPTABLES_SAVE"
+  echo "Cleaned"
+}
+
+run_in_ns() {
+  require_root
+  [[ $# -gt 0 ]] || { echo "Usage: sudo $0 run <cmd> [args...]"; exit 1; }
+
+  local target_user="${SUDO_USER:-$USER}"
+  [[ "$target_user" != "root" ]] || { echo "Refusing to run as root"; exit 1; }
+
+  ip netns add "$NS_NAME" 2>/dev/null || true
+  ensure_veth_host
+
+  if [[ ! -f "$DNSMASQ_PID" ]] || ! kill -0 "$(cat "$DNSMASQ_PID")" 2>/dev/null; then
+    start_dnsmasq
+  fi
+
+  # Rebuild veth peer inside the namespace
+  ip link del "$VETH_HOST" 2>/dev/null || true
+  ip link add "$VETH_HOST" type veth peer name "$VETH_NS"
+  ip link set "$VETH_NS" netns "$NS_NAME"
+  ip addr add "${HOST_IP}/24" dev "$VETH_HOST" 2>/dev/null || true
+  ip link set "$VETH_HOST" up
+
+  ip netns exec "$NS_NAME" ip addr add "${NS_IP}/24" dev "$VETH_NS"
+  ip netns exec "$NS_NAME" ip link set "$VETH_NS" up
+  ip netns exec "$NS_NAME" ip link set lo up
+  ip netns exec "$NS_NAME" ip route replace default via "$HOST_IP"
+
+  # Disable IPv6 inside the namespace
+  ip netns exec "$NS_NAME" sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null || true
+  ip netns exec "$NS_NAME" sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null || true
+
+  mkdir -p "/etc/netns/$NS_NAME"
+  echo "nameserver ${HOST_IP}" > "/etc/netns/$NS_NAME/resolv.conf"
+
+  echo "Namespace ready. Running as ${target_user} ..."
+  ip netns exec "$NS_NAME" sudo -u "$target_user" -- "$@"
+}
+
+case "${1:-}" in
+  setup)  setup_host ;;
+  clean)  clean_host ;;
+  run)    shift; run_in_ns "$@" ;;
+  ""|-h|--help)
+    cat <<EOF
+Usage:
+  sudo $0 setup
+  sudo $0 clean
+  sudo $0 run <cmd> [args...]
+  sudo $0 <cmd> [args...]
+
+Persistence (optional):
+  Add to /etc/rc.d/rc.local or a startup script:
+    iptables-restore < /etc/nstor/iptables.rules
+    $0 setup   # or just the dnsmasq part
+
+Passwordless sudo (optional):
+  echo "user ALL=(ALL) NOPASSWD: /usr/local/bin/nstor" > /etc/sudoers.d/nstor
+  chmod 440 /etc/sudoers.d/nstor
+EOF
+    ;;
+  *) run_in_ns "$@" ;;
+esac
